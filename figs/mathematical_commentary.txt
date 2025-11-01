@@ -1,0 +1,5 @@
+Analytical Commentary
+----------------------
+Growth rate (CAGR approximation): 0.0146
+Hashtag entropy (bits): 3.320; normalized: 1.000
+Elasticity (d ln interactions / d ln views): 0.000
