@@ -1,0 +1,53 @@
+﻿Field,Description
+SID,Sequence ID
+ID,Instagrams ID for that could be used on the website ex: ID=230466055 the url is https://www.instagram.com/explore/locations/230466055
+Name,Locations Name
+Streen,"Streed Address, may contain '\n'"
+ZIP,Zip code
+City,City Name
+Region,Region
+CD,Country Code
+Phone,The phone in format as on the Instragram
+aj_exact_city_match,The Instagrams Internal key
+aj_exact_country_match,The Instagrams Internal key
+blurb,"Description of the place, may contain '\n'"
+dir_city_id,The Instagrams internal City ID
+dir_city_name,city Name
+dir_city_slug,City tag (sortof)
+dir_country_id,Country ID
+dir_country_name,country
+lat,Latitude
+lng,Longtitude
+primary_alias_on_fb,Bool Flag
+slug,
+website,"The URL to web site, may contain more then 1 URL, may contain '\n'"
+cts,Timestamp when the location was visited
+,
+Profiles,
+,
+Field,Description
+SID,Sequence ID
+profile_id,Instagrams ID
+profile_name,profile name
+firstname_lastname,firstname lastname
+description,May contain '\n'
+following,Number of following profile at the moment it was visited
+Followers,Number of followers at the moment it was visited
+n_posts,Number of posts at the moment it was visited
+URL,Url
+cts,Timestamp when the profile was visited
+is_business_account,Boolean flag if that profile was makred by the owner as business account
+,
+Posts,
+,
+Field,Description
+SID,Sequence ID
+sid_profile,Sequence ID of the profile from ## Profiles tabke
+post_id,Instagrams ID
+profile_id,Instagrams ID may be null
+location_id,Instagrams ID
+cts,Timestamp when the Post was created
+post_type,"1 - Photo, 2 - Video, 3 - multy"
+description,May contain '\n'
+numbr_likes,Number of Likes at the moment it was visited
+number_comments,Number of comments at the moment it was visited
