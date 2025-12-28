@@ -640,7 +640,320 @@ def run_ml_prediction(df, args):
     fig.savefig(out, dpi=160)
     plt.close(fig)
     print(f"[Saved] {out}")
+# ============================================================
+# 7. Advanced ML Module: Platform-aware Virality Classifier
+#    （高级ML模块：考虑平台差异的“能不能火”预测）
+# ------------------------------------------------------------
+# Business motivation / 业务动机：
+# 我们现在的脚本已经能做：
+#   - 基础EDA
+#   - 时间序列看热门Hashtag
+#   - Hashtag共现图
+#   - 一个简单的分类demo（如果有 Engagement_Level）
+# 但在真实团队里，老板更想听的问题通常是：
+#   “如果我今天再发一条这样的内容，它有多大概率进高互动那一档？”
+# 而且这个问题要“对平台公平”——TikTok的量级和LinkedIn不一样，
+# 所以不能直接用一个全局阈值，我们要在“各自平台内部”去挑top帖子。
+#
+# 这个模块要做的事情：
+#   1. 把每个平台内部的帖子，按 Engagement_Rate（或Likes）排序
+#   2. 在每个平台里取例如 90 分位数以上的帖子标记为 1 = viral
+#   3. 用表格模型（CatBoost / LightGBM / RF都行）去学
+#   4. 给出特征重要性，方便我们解释给老板/市场同事听
+#   5. 可以选择把训练好的特征重要性 / 报告存到同一个 figs/ 目录，方便统一查阅
+#
+# 使用方式：
+#   在 main() 里，读完 df、做完特征工程之后，调用：
+#       run_platform_aware_viral_classifier(df, args)
+#
+# 注意：
+#   - 这个函数会尽量“只读不改”你的 df（除了临时列），不会破坏你前面逻辑
+#   - 你也可以把 percentile_from_args 调高/调低来控制“多严格叫火”
+# ============================================================
 
+def run_platform_aware_viral_classifier(
+    df,
+    args=None,
+    datecol: str = "Post_Date",
+    engagement_col_candidates=("Engagement_Rate", "Likes", "Views"),
+    platform_col: str = "Platform",
+    percentile: float = 0.9,
+    save_dir: str = "figs",
+):
+    """
+    Train a *platform-aware* virality classifier.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Cleaned social media dataframe, after feature engineering
+        (i.e. time features + engagement features already added).
+    args : argparse.Namespace or None
+        We use it only to keep the style consistent with the rest of the file.
+        If provided, we will try to read savefigs / datecol from it.
+    datecol : str
+        Name of the datetime column.
+    engagement_col_candidates : tuple[str]
+        We will try these in order to decide which column to use
+        as the "engagement strength". First one that exists & is numeric wins.
+    platform_col : str
+        Column that identifies the platform (TikTok, IG, X, YouTube...).
+        We will create labels *inside* each platform.
+    percentile : float
+        Platform-wise percentile to define "viral". 0.9 means
+        "top 10% of posts *within each platform*".
+    save_dir : str
+        Directory to save reports / plots.
+
+    What this function does
+    -----------------------
+    1. Pick an engagement metric.
+    2. For every platform, compute the chosen percentile.
+    3. Make a binary label:
+           viral = engagement >= platform_percentile
+    4. Build feature matrix:
+           - categorical: platform, content_type, region, hashtag
+           - numeric: views, likes, shares, comments, engagement_rate, hour, weekday, month
+    5. Train a classifier, preferring CatBoost (best for mixed tabular).
+       If CatBoost is not installed, fall back to XGBoost, then to RandomForest.
+    6. Save classification report + confusion matrix + feature importances.
+
+    This is "presentation-grade":
+    - Boss can see: what's the definition of viral
+    - Team can see: which features actually matter
+    - Coworkers can re-use: same df, same args, same folder
+    """
+    import os
+    import numpy as np
+    import pandas as pd
+    from pathlib import Path
+
+    # ------------- 0. sync with upstream args -------------
+    if args is not None:
+        # prefer args' datecol / savefigs if present
+        datecol = getattr(args, "datecol", datecol)
+        save_dir = getattr(args, "savefigs", save_dir)
+
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    # ------------- 1. pick engagement metric ---------------
+    metric_col = None
+    for c in engagement_col_candidates:
+        if c in df.columns:
+            metric_col = c
+            break
+    if metric_col is None:
+        print("[viral clf] No engagement-like column found, skipping.")
+        return
+
+    # make sure numeric
+    df = df.copy()
+    df[metric_col] = pd.to_numeric(df[metric_col], errors="coerce")
+
+    # ------------- 2. check platform column ----------------
+    if platform_col not in df.columns:
+        # if no platform, we can only do global percentile
+        print(f"[viral clf] Column '{platform_col}' not found, using GLOBAL percentile.")
+        global_thr = df[metric_col].quantile(percentile)
+        df["__viral_label__"] = (df[metric_col] >= global_thr).astype(int)
+    else:
+        # platform-aware threshold
+        def _mark_platform(group: pd.DataFrame) -> pd.DataFrame:
+            thr = group[metric_col].quantile(percentile)
+            group["__viral_label__"] = (group[metric_col] >= thr).astype(int)
+            group["__viral_threshold__"] = thr
+            return group
+
+        df = df.groupby(platform_col, group_keys=False).apply(_mark_platform)
+
+    # ------------- 3. build feature sets -------------------
+    # candidate categorical features
+    cat_features = []
+    for c in ["Platform", "Content_Type", "Region", "Hashtag"]:
+        if c in df.columns:
+            cat_features.append(c)
+
+    # candidate numeric features
+    num_features = []
+    for c in [
+        "Views",
+        "Likes",
+        "Shares",
+        "Comments",
+        "Engagement_Rate",
+        "Hour",
+        "Weekday",
+        "Month",
+    ]:
+        if c in df.columns:
+            num_features.append(c)
+
+    # drop rows without label
+    df = df.dropna(subset=["__viral_label__", metric_col])
+
+    # if literally no positive / no negative, skip
+    if df["__viral_label__"].nunique() < 2:
+        print("[viral clf] Label collapsed to a single class, nothing to train.")
+        return
+
+    # ------------- 4. train-test split ---------------------
+    from sklearn.model_selection import train_test_split
+
+    X = df[cat_features + num_features].copy()
+    y = df["__viral_label__"].astype(int)
+
+    # split – if we have a date, we could do time-based split;
+    # here we'll do random split for simplicity
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=42, stratify=y
+    )
+
+    # ------------- 5. build preprocessing ------------------
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_features),
+            ("num", StandardScaler(), num_features),
+        ]
+    )
+
+    # ------------- 6. choose model (CatBoost -> XGB -> RF) -------------
+    model = None
+    used_model_name = None
+
+    try:
+        from catboost import CatBoostClassifier
+
+        # note: we *could* feed raw cat features to CatBoost directly,
+        # but to stay consistent with the rest of the file (which uses
+        # sklearn-like flows), we still go through preprocessor.
+        from sklearn.pipeline import Pipeline
+
+        model = Pipeline(
+            steps=[
+                ("prep", preprocessor),
+                (
+                    "clf",
+                    CatBoostClassifier(
+                        depth=6,
+                        learning_rate=0.08,
+                        loss_function="Logloss",
+                        verbose=False,
+                        random_state=42,
+                    ),
+                ),
+            ]
+        )
+        used_model_name = "CatBoostClassifier"
+    except Exception:
+        try:
+            from xgboost import XGBClassifier
+            from sklearn.pipeline import Pipeline
+
+            model = Pipeline(
+                steps=[
+                    ("prep", preprocessor),
+                    (
+                        "clf",
+                        XGBClassifier(
+                            n_estimators=300,
+                            learning_rate=0.05,
+                            max_depth=6,
+                            subsample=0.9,
+                            colsample_bytree=0.9,
+                            objective="binary:logistic",
+                            eval_metric="logloss",
+                            random_state=42,
+                        ),
+                    ),
+                ]
+            )
+            used_model_name = "XGBClassifier"
+        except Exception:
+            # final fallback
+            from sklearn.ensemble import RandomForestClassifier
+            from sklearn.pipeline import Pipeline
+
+            model = Pipeline(
+                steps=[
+                    ("prep", preprocessor),
+                    (
+                        "clf",
+                        RandomForestClassifier(
+                            n_estimators=250,
+                            max_depth=None,
+                            random_state=42,
+                            n_jobs=-1,
+                        ),
+                    ),
+                ]
+            )
+            used_model_name = "RandomForestClassifier"
+
+    # ------------- 7. fit ---------------------
+    model.fit(X_train, y_train)
+
+    # ------------- 8. evaluate ----------------
+    from sklearn.metrics import (
+        classification_report,
+        confusion_matrix,
+        ConfusionMatrixDisplay,
+    )
+    import matplotlib.pyplot as plt
+
+    y_pred = model.predict(X_test)
+
+    report = classification_report(y_test, y_pred, digits=4)
+    print("[viral clf] ===== classification report =====")
+    print(report)
+
+    # save report
+    report_path = os.path.join(save_dir, "viral_classifier_report.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(f"Model used: {used_model_name}\n")
+        f.write(f"Percentile (platform-wise): {percentile}\n")
+        f.write(f"Metric column: {metric_col}\n")
+        f.write("\n")
+        f.write(report)
+    print(f"[viral clf] report saved to {report_path}")
+
+    # confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["non-viral", "viral"])
+    fig, ax = plt.subplots(figsize=(5, 4))
+    disp.plot(ax=ax, cmap="Blues", colorbar=False)
+    ax.set_title("Viral Classifier – Confusion Matrix")
+    plt.tight_layout()
+    cm_path = os.path.join(save_dir, "viral_classifier_confusion_matrix.png")
+    plt.savefig(cm_path, dpi=200)
+    plt.close()
+    print(f"[viral clf] confusion matrix saved to {cm_path}")
+
+    # ------------- 9. feature importances (if available) -------------
+    # Only possible if our final step has feature_importances_
+    # and we can recover the feature names from the preprocessor.
+    try:
+        final_clf = model.named_steps["clf"]
+        # recover feature names
+        ohe: OneHotEncoder = model.named_steps["prep"].named_transformers_["cat"]
+        cat_feature_names = list(ohe.get_feature_names_out(cat_features))
+        num_feature_names = num_features
+        all_feature_names = cat_feature_names + num_feature_names
+
+        importances = getattr(final_clf, "feature_importances_", None)
+        if importances is not None:
+            imp_df = pd.DataFrame(
+                {"feature": all_feature_names, "importance": importances}
+            ).sort_values("importance", ascending=False)
+            imp_path = os.path.join(save_dir, "viral_classifier_feature_importances.csv")
+            imp_df.to_csv(imp_path, index=False)
+            print(f"[viral clf] feature importances saved to {imp_path}")
+    except Exception as e:
+        print(f"[viral clf] could not extract feature importances: {e}")
+
+    print(f"[viral clf] DONE. Model used: {used_model_name}")
 # -------------------------
 # Main
 # -------------------------
@@ -668,6 +981,7 @@ def main():
     # ML
     run_ml_prediction(df, args)
     generate_mathematical_commentary(df, args, datecol=args.datecol)
-
+# 👇 新加的
+    run_platform_aware_viral_classifier(df, args, datecol=args.datecol)
 if __name__ == "__main__":
     main()
